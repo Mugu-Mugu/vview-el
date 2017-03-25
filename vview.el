@@ -1,4 +1,4 @@
-;;; perspective.el --- switch between named "perspectives" of the editor
+;;; vview.el --- switch between named "virtual view" of the editor -*- lexical-binding: t -*-
 
 ;; Copyright (C) 2008-2015 Natalie Weizenbaum <nex342@gmail.com>
 ;;
@@ -69,22 +69,23 @@ Always evaluate to nil."
 (defun vview--make-rule-name (pattern)
   "Return a function checking if a buffer name match PATTERN."
   (if (stringp pattern)
-      `(lambda (buffer)
-         (s-matches-p ,pattern (buffer-name buffer)))
+      (lambda (buffer)
+         (s-matches-p pattern (buffer-name buffer)))
     #'vview-rule-buffer-owned-default-p))
 
 (defun vview--make-rule-path (path)
   "Return a function checking if a buffer directory match PATH."
-  (if (stringp path)
-      `(lambda (buffer)
-         (s-matches-p ,path
-                      (buffer-local-value 'default-directory buffer)))
+  (if (file-exists-p (file-truename path))
+      (lambda (buffer)
+        (file-in-directory-p (file-truename (buffer-local-value 'default-directory
+                                                                buffer))
+                             (file-truename path)))
     #'vview-rule-buffer-owned-default-p))
 
 (defun vview--make-rule-mode (mode)
   "Return a function checking if a buffer directory major mode is MODE."
-  `(lambda (buffer)
-     (equal ',mode (buffer-local-value 'major-mode buffer))))
+  (lambda (buffer)
+     (equal mode (buffer-local-value 'major-mode buffer))))
 
 (defun vview--validate-score (unchecked-score)
   "Check that UNCHECKED-SCORE is a score or return a nil score instead."
@@ -96,6 +97,7 @@ Always evaluate to nil."
 ;; All rules have the same structure and must define a rule-id, a score value
 ;; and a predicate taking a buffer in parameter.
 ;; Several predefined constructor are available for the most common rules.
+;; MAYBE refactor this to avoid code duplication.
 (cl-defstruct
     (vview-rule
      (:constructor nil)
@@ -136,7 +138,6 @@ Always evaluate to nil."
                     &key (score 0) (names (list)) (paths (list)) (modes (list))
                     &aux
                     (score (vview--validate-score score))
-
                     (rules (-concat
                             (when paths (--map (apply 'vview-rule-path-new (-flatten (list it))) paths))
                             (when names (--map (apply 'vview-rule-name-new (-flatten (list it))) names))
@@ -213,6 +214,10 @@ Always evaluate to nil."
   "Make SYMBOL vview local."
   (add-to-list 'vview-local-vars symbol))
 
+(defun vview-is-registered (view-name)
+  "Return t if a view with name VIEW-NAME is registered."
+  (ht-contains-p vview-views view-name))
+
 (defun vview-register-view (a-vview)
   "Register A-VVIEW into `vview-views'.
 In addition, save in A-VVIEW the current local variable and create a virgin
@@ -236,19 +241,19 @@ window configuration."
     (setq vview-history (-remove-item vview-name vview-history))
     (ht-remove! vview-views vview-name)))
 
-(defun vview-switch-view (vview-name)
-  "Switch to a vview with name VVIEW-NAME."
-  (if (ht-contains-p vview-views vview-name)
-      (progn
-        ;; current is the view before switch
-        (vview-save-local-vars (vview-current-view))
-        (vview-save-window-conf (vview-current-view))
-        (push vview-name vview-history)
-        (delete-dups vview-history)
-        ;; current is the new view
-        (vview-load-local-vars (vview-current-view))
-        (vview-load-window-conf (vview-current-view)))
-    (error "%s is not a known view" vview-name)))
+(defun vview-switch-view (vview-or-name)
+  "Switch to a vview with name VVIEW-OR-NAME.
+Raise an error if VVIEW-OR-NAME is not a view or is not a name of a view that
+had been registered."
+  (let* ((the-new-view (vview-get-registered-view vview-or-name))
+         (the-new-view-name (vview-view-name the-new-view))
+         (the-old-view (vview-current-view)))
+    (vview-save-local-vars the-old-view)
+    (vview-save-window-conf the-old-view)
+    (push the-new-view-name vview-history)
+    (delete-dups vview-history)
+    (vview-load-local-vars the-new-view)
+    (vview-load-window-conf the-new-view)))
 
 (defun vview-get-history-rank (a-vview)
   "Return the place in `vview-history' for A-VVIEW."
@@ -279,12 +284,12 @@ If no view owns BUFFER, current view is returned."
 (defun vview-current-buffer-list ()
   "Return a list of buffer for current view."
   (if (> (length vview-history) 0)
-      (vview-buffer-list (ht-get vview-views (first vview-history)))
+      (vview-buffer-list (ht-get vview-views (nth 0 vview-history)))
     (buffer-list)))
 
 (defun vview-current-buffer-name-list ()
   "Return a list of buffer for current view."
-  (-map (lambda (buffer) (buffer-name buffer)) (vview-current-buffer-list)))
+  (vview-mu-filter-trash-buffer (vview-current-buffer-list)))
 
 (defun vview-switch-buffer (buffer)
   "Switch to BUFFER by changing view if needed."
@@ -296,7 +301,7 @@ If no view owns BUFFER, current view is returned."
 
 (defun vview-current-view ()
   "Return current vview if it exists."
-  (when vview-history (ht-get vview-views (first vview-history))))
+  (when vview-history (ht-get vview-views (nth 0 vview-history))))
 
 (defun vview-get-registered-view (vview-or-name)
   "Return the registered vview associated to VVIEW-OR-NAME.
@@ -304,13 +309,22 @@ VVIEW-OR-NAME can be a VVIEW or the name of a VVIEW.
 If no such vview is registered, an error is raised."
   (let ((vview-name (cond ((vview-view-p vview-or-name) (vview-view-name vview-or-name))
                           (t vview-or-name))))
-    (unless (not (ht-contains-p vview-views vview-name))
+    (if (ht-contains-p vview-views vview-name)
+        (ht-get vview-views vview-name)
       (error "%s is not registered" vview-name))))
+
+(defun vview-mu-filter-trash-buffer (buffer-list)
+  "Return a list of buffer from BUFFER-LIST without useless buffers.
+Useless buffers are those starting with a leading space."
+  (-remove (lambda (buffer) (string-match-p "\\` " buffer))
+           (-map (lambda (buffer) (buffer-name buffer))
+                 buffer-list)))
 
 (defun ivyew-switch-buffer-current-view ()
   "Interactivly switch buffer to another in current view."
   (interactive)
-  (ivy-read "Switch buffer in current view: " (vview-current-buffer-name-list)
+  (ivy-read "Switch buffer in current view: "
+            (vview-current-buffer-name-list)
             :preselect (nth 1 (vview-current-buffer-name-list))
             :action #'switch-to-buffer
             :keymap ivy-switch-buffer-map))
@@ -318,10 +332,8 @@ If no such vview is registered, an error is raised."
 (defun ivyew-switch-buffer-all-view ()
   "Interactivly switch buffer to another in current view."
   (interactive)
-  (let ((buffer-name-list (-remove (lambda (buffer) (string-match-p "\\` " buffer))
-                                   (-map (lambda (buffer) (buffer-name buffer))
-                                         (buffer-list)))))
-    (ivy-read "Switch buffer in current view: "
+  (let ((buffer-name-list (vview-mu-filter-trash-buffer (buffer-list))))
+    (ivy-read "Switch buffer in all views: "
               buffer-name-list
               :preselect (nth 1 buffer-name-list)
               :action #'vview-switch-buffer
@@ -334,36 +346,6 @@ If no such vview is registered, an error is raised."
             vview-history
             :action #'vview-switch-view
             :preselect (nth 1 vview-history)))
-
-(vview-score-buffer (vview-current-view) (current-buffer))
-(setq vview-history (list))
-(message "%s" vview-views)
-(message "%s" vview-history)
-(setq default-directory "/home")
-(vview-get-best-view (get-buffer "zefezfezfez"))
-(vview-switch-buffer (get-buffer "zefezfezfez"))
-(vview-current-buffer-list)
-(vview-switch-view "mugu")
-(vview-switch-view "mugu2")
-(vview-switch-view "mugu4")
-(vview-register-view  (vview-new "mugu"
-                                 :modes '(org-mode)))
-(vview-register-view  (vview-new "mugu2"
-                                 :paths '("/usr")
-                                 :names '(".*el$")))
-(vview-register-view  (vview-new "mugu3"
-                                 :score 2
-                                 :paths '("/usr")
-                                 :names '(".*el$")))
-(vview-register-view  (vview-new "mugu4"
-                                 :score 2
-                                 :paths '("/usr")
-                                 :names '(".*el$")))
-(vview-make-var-local 'default-directory)
-(vview-unregister-view "mugu")
-(vview-unregister-view "mugu2")
-(vview-unregister-view "mugu3")
-(vview-unregister-view "mugu4")
 
 ;; for mode line
 (defun safe-persp-name (&optional unused)
@@ -385,41 +367,15 @@ named collections of buffers and window configurations."
   :global t
   (if persp-mode
       (progn
-        (setq vview-views ht-create)
+        (setq vview-views (ht-create))
         (setq vview-history (list))
         (setq vview-local-vars (list))
+        ;;  by default default view old every buffer but every other view should
+        ;;  take precedence over it by default
         (vview-register-view (vview-new "default-view"
-                                        :names '(".*")))
+                                        :names '(".*")
+                                        :score -1))
         (vview-switch-view "default-view"))))
-
-;; projectile perspectives or directory perspective:
-;; filter out : none (or temp buffer)
-;; filter in  : default directory child of root
-
-;; perspectives by name:
-;; filter out : none
-;; filter in : name with matching pattern
-
-;;
-
-
-;; vview : special buffer
-;; gather special buffer
-;; dont want to switch automatically on it
-
-;; vview : project
-;; gather project based on either root directory or the fact that is owned by the project
-;; explicit switch is mandatory unless shadowed
-
-;; vview : special special buffer
-;; message/debug or magit or anything else
-;; explicit switch is ok but it is also ok to not have
-
-;; vview : specific mode
-;; typically org files, mail things etc
-
-;; switch buffer in view
-;; switch buffer all views
 
 
 (provide 'vview)
